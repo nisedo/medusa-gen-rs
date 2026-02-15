@@ -76,8 +76,7 @@ fn find_medusa_json_child(root: &Path) -> Option<PathBuf> {
 }
 
 fn update_medusa_json(path: &Path) -> Result<()> {
-    let content =
-        fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?;
+    let content = fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?;
     let (updated, changed) = patch_medusa_json(&content);
     if changed {
         fs::write(path, updated).context("Failed to write medusa.json")?;
@@ -86,7 +85,7 @@ fn update_medusa_json(path: &Path) -> Result<()> {
 }
 
 fn patch_medusa_json(content: &str) -> (String, bool) {
-    let mut output = Vec::new();
+    let mut output: Vec<String> = Vec::new();
     let mut changed = false;
     let mut depth: i32 = 0;
     let mut compilation_depth: Option<i32> = None;
@@ -118,8 +117,24 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
 
         if let Some(pdepth) = platform_depth {
             if depth_before == pdepth && trimmed.starts_with('}') && !saw_target {
+                if let Some(last) = output.last_mut() {
+                    let (last_line, last_ending) = split_line_ending(last);
+                    let last_trim = last_line.trim_end();
+                    if !last_trim.is_empty()
+                        && !last_trim.ends_with(',')
+                        && !last_trim.ends_with('{')
+                        && !last_trim.ends_with('[')
+                    {
+                        let mut updated = String::new();
+                        updated.push_str(last_line);
+                        updated.push(',');
+                        updated.push_str(last_ending);
+                        *last = updated;
+                    }
+                }
                 let insert_line = format!("{}  \"target\": \"test/fuzzing\"", platform_indent);
-                output.push(insert_line);
+                let insert_ending = if line_ending.is_empty() { "\n" } else { line_ending };
+                output.push(format!("{insert_line}{insert_ending}"));
                 changed = true;
             }
         }
@@ -294,7 +309,6 @@ fn ensure_medusa_json(root: &Path) -> Result<()> {
     Ok(())
 }
 
-
 fn handler_name_for(contract_name: &str) -> String {
     if contract_name.starts_with("Handler") {
         contract_name.to_string()
@@ -388,7 +402,6 @@ fn create_property_contracts_from_parsed(
     Ok(contracts)
 }
 
-
 /// Move the content of a temp folder to the fuzz test folder
 fn move_temp_contents(temp_dir: &TempDir, overwrite: bool) -> Result<()> {
     let path = Path::new("./test/fuzzing");
@@ -420,11 +433,9 @@ fn move_temp_contents(temp_dir: &TempDir, overwrite: bool) -> Result<()> {
 /// Generate and write the test suite
 pub fn generate_test_suite(args: &Args) -> Result<()> {
     let temp_dir = TempDir::new().context("Failed creating temp dir")?; // will be deleted once dropped
-    let current_dir =
-        std::env::current_dir().context("Failed to determine current directory")?;
+    let current_dir = std::env::current_dir().context("Failed to determine current directory")?;
 
-    ensure_medusa_json(current_dir.as_path())
-        .context("Failed to ensure medusa.json")?;
+    ensure_medusa_json(current_dir.as_path()).context("Failed to ensure medusa.json")?;
 
     let parsed_repo = parse_repo(current_dir.as_path(), args.exclude_scripts)
         .context("Failed to parse current directory")?;
@@ -609,7 +620,6 @@ mod tests {
         assert_eq!(parse_parents(parents.as_ref()), "");
     }
 
-
     // All the move_temp_contents are in serial to avoid having race conditions
     #[test]
     #[serial]
@@ -714,8 +724,6 @@ mod tests {
         let args = Args {
             overwrite: true,
             solc: "0.8.23".to_string(),
-            nb_handlers: 2,
-            nb_properties: 1,
             exclude_scripts: true,
         };
 
@@ -723,8 +731,7 @@ mod tests {
         assert!(result.is_ok());
 
         let fuzz_dir = Path::new("test/fuzzing");
-        assert!(fuzz_dir.join("handlers/HandlersA.t.sol").exists());
-        assert!(fuzz_dir.join("handlers/HandlersB.t.sol").exists());
+        assert!(fuzz_dir.join("handlers/HandlerSample.t.sol").exists());
         assert!(fuzz_dir.join("handlers/HandlersParent.t.sol").exists());
         assert!(fuzz_dir.join("properties/PropertiesSample.t.sol").exists());
         assert!(fuzz_dir.join("properties/PropertiesParent.t.sol").exists());

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/defi-wonderland/medusa-gen-rs"
 license = "MIT"
-readme = "readme.MD"
+readme = "README.md"
 keywords = ["medusa", "solidity", "fuzzing", "template"]
 categories = ["command-line-utilities"]
 

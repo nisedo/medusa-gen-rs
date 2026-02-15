@@ -10,15 +10,15 @@ The following contracts are generated in `./test/fuzzing`:
 
 ```
 test/fuzzing/
-  FuzzTest.t.sol
-  Setup.t.sol
-  PROPERTIES.md
-  handlers/
-    HandlersParent.t.sol
-    Handler<ContractName>.t.sol
-  properties/
-    PropertiesParent.t.sol
-    Properties<ContractName>.t.sol
+├── FuzzTest.t.sol
+├── Setup.t.sol
+├── PROPERTIES.md
+├── handlers/
+│   ├── HandlersParent.t.sol
+│   └── Handler<ContractName>.t.sol
+└── properties/
+    ├── PropertiesParent.t.sol
+    └── Properties<ContractName>.t.sol
 ```
 
 Inheritance tree:
@@ -57,8 +57,6 @@ medusa-gen --overwrite
 - `--exclude-scripts` / `--no-exclude-scripts`: Exclude `script/` directories and `*Script` contracts (default: exclude).
 - `--overwrite`: Overwrite `./test/fuzzing` if it already exists.
 
-Legacy flags `--nb-handlers` and `--nb-properties` are ignored (kept for compatibility).
-
 ## Parsing and ABI
 
 By default, `medusa-gen` runs `forge build` and reads ABIs from `out/` to discover public/external state-changing functions, including inherited ones. If ABI parsing fails, it falls back to a lightweight source parser and logs the fallback.
@@ -70,7 +68,7 @@ If a function has tuple types, the handler uses a raw calldata wrapper:
 
 ## Medusa config
 
-If `medusa.json` is not found in the repo root (or one level below), `medusa-gen` runs `medusa init` and then patches the root config, preserving formatting:
+If `medusa.json` is not found in the repo root (or one level below), `medusa-gen` runs `medusa init` and then patches the root config:
 
 - `"corpusDirectory": "test/fuzzing/medusa-corpus"`
 - `"targetContracts": ["FuzzTest"]`

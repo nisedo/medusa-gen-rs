@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,7 +63,12 @@ fn parse_repo_from_source(root: &Path, exclude_scripts: bool) -> Result<ParsedRe
     let mut contracts = Vec::new();
     let mut seen = HashSet::new();
     let source_root = pick_source_root(root);
-    visit_dir(source_root.as_path(), &mut contracts, &mut seen, exclude_scripts)?;
+    visit_dir(
+        source_root.as_path(),
+        &mut contracts,
+        &mut seen,
+        exclude_scripts,
+    )?;
     contracts.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(ParsedRepo { contracts })
 }
@@ -132,7 +137,14 @@ fn parse_repo_from_abi(root: &Path, exclude_scripts: bool) -> Result<ParsedRepo>
 
     let mut contracts = Vec::new();
     let mut seen = HashSet::new();
-    visit_out_dir(&out_dir, &config, exclude_scripts, &mut contracts, &mut seen)?;
+    visit_out_dir(
+        &out_dir,
+        root,
+        &config,
+        exclude_scripts,
+        &mut contracts,
+        &mut seen,
+    )?;
     contracts.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(ParsedRepo { contracts })
@@ -184,6 +196,7 @@ fn read_forge_config(root: &Path) -> Result<ForgeConfig> {
 
 fn visit_out_dir(
     root: &Path,
+    repo_root: &Path,
     config: &ForgeConfig,
     exclude_scripts: bool,
     contracts: &mut Vec<ParsedContract>,
@@ -202,7 +215,7 @@ fn visit_out_dir(
             if name == "build-info" {
                 continue;
             }
-            visit_out_dir(&path, config, exclude_scripts, contracts, seen)?;
+            visit_out_dir(&path, repo_root, config, exclude_scripts, contracts, seen)?;
             continue;
         }
 
@@ -210,7 +223,7 @@ fn visit_out_dir(
             continue;
         }
 
-        if let Some(contract) = parse_abi_artifact(&path, config, exclude_scripts)? {
+        if let Some(contract) = parse_abi_artifact(&path, repo_root, config, exclude_scripts)? {
             if seen.insert(contract.name.clone()) {
                 contracts.push(contract);
             }
@@ -222,13 +235,13 @@ fn visit_out_dir(
 
 fn parse_abi_artifact(
     path: &Path,
+    repo_root: &Path,
     config: &ForgeConfig,
     exclude_scripts: bool,
 ) -> Result<Option<ParsedContract>> {
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let value: Value =
-        serde_json::from_str(&content).context("Failed to parse artifact JSON")?;
+    let value: Value = serde_json::from_str(&content).context("Failed to parse artifact JSON")?;
 
     let metadata = match value.get("metadata") {
         Some(Value::Object(obj)) => obj,
@@ -266,6 +279,10 @@ fn parse_abi_artifact(
         return Ok(None);
     }
 
+    if is_library_contract(repo_root, source_path, contract_name) {
+        return Ok(None);
+    }
+
     let abi = match value.get("abi").and_then(Value::as_array) {
         Some(abi) => abi,
         None => return Ok(None),
@@ -292,7 +309,10 @@ fn parse_abi_functions(abi: &[Value]) -> Vec<ParsedFunction> {
             Some(name) if !name.is_empty() => name.to_string(),
             _ => continue,
         };
-        let state = item.get("stateMutability").and_then(Value::as_str).unwrap_or("");
+        let state = item
+            .get("stateMutability")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if state == "view" || state == "pure" {
             continue;
         }
@@ -307,8 +327,7 @@ fn parse_abi_functions(abi: &[Value]) -> Vec<ParsedFunction> {
             None => &[],
         };
         let raw_call = inputs.iter().any(abi_type_contains_tuple);
-        let signature_types: Vec<String> =
-            inputs.iter().filter_map(abi_type_signature).collect();
+        let signature_types: Vec<String> = inputs.iter().filter_map(abi_type_signature).collect();
         let signature = format!("{}({})", name, signature_types.join(","));
 
         let params = if raw_call {
@@ -385,6 +404,34 @@ fn needs_calldata(ty: &str) -> bool {
     ty == "bytes" || ty == "string" || ty.contains('[')
 }
 
+fn is_library_contract(root: &Path, source_path: &str, contract_name: &str) -> bool {
+    let path = root.join(source_path);
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(_) => return false,
+    };
+    let stripped = strip_comments(&source);
+    let mut idx = 0usize;
+    while let Some(pos) = find_keyword(&stripped, idx, "library") {
+        let mut i = pos + "library".len();
+        i = skip_whitespace(stripped.as_bytes(), i);
+        let name_start = i;
+        while i < stripped.len() && is_ident_char(stripped.as_bytes()[i]) {
+            i += 1;
+        }
+        if name_start == i {
+            idx = pos + "library".len();
+            continue;
+        }
+        let name = stripped[name_start..i].trim();
+        if name == contract_name {
+            return true;
+        }
+        idx = i;
+    }
+    false
+}
+
 fn visit_dir(
     root: &Path,
     contracts: &mut Vec<ParsedContract>,
@@ -446,7 +493,11 @@ fn parse_sol_file(path: &Path) -> Result<Vec<ParsedContract>> {
             (interface_pos, "interface"),
         ] {
             if let Some(pos) = pos {
-                if next.map_or(true, |(best, _)| pos < best) {
+                let should_take = match &next {
+                    None => true,
+                    Some((best, _)) => pos < *best,
+                };
+                if should_take {
                     next = Some((pos, keyword));
                 }
             }
@@ -516,7 +567,7 @@ fn strip_comments(source: &str) -> String {
         if in_string {
             if c == '\\' {
                 out.push(' ');
-                if let Some(_) = chars.next() {
+                if chars.next().is_some() {
                     out.push(' ');
                 }
                 continue;
@@ -659,7 +710,13 @@ fn analyze_modifiers(modifiers: &str) -> (bool, bool, bool, bool, bool) {
         }
     }
 
-    (is_public, is_external, is_internal_private, is_view_pure, is_payable)
+    (
+        is_public,
+        is_external,
+        is_internal_private,
+        is_view_pure,
+        is_payable,
+    )
 }
 
 fn parse_params(params: &str) -> Vec<FunctionParam> {
@@ -736,10 +793,7 @@ fn parse_param(param: &str, idx: usize) -> Option<FunctionParam> {
 }
 
 fn signature_from_params(name: &str, params: &[FunctionParam]) -> String {
-    let types: Vec<String> = params
-        .iter()
-        .map(|p| canonicalize_type(&p.ty))
-        .collect();
+    let types: Vec<String> = params.iter().map(|p| canonicalize_type(&p.ty)).collect();
     format!("{}({})", name, types.join(","))
 }
 
@@ -779,18 +833,20 @@ fn is_token_boundary(haystack: &str, start: usize, len: usize) -> bool {
         Some(bytes[start + len])
     };
 
-    let before_ok = before.map_or(true, |b| !is_ident_char(b));
-    let after_ok = after.map_or(true, |b| !is_ident_char(b));
+    let before_ok = match before {
+        None => true,
+        Some(b) => !is_ident_char(b),
+    };
+    let after_ok = match after {
+        None => true,
+        Some(b) => !is_ident_char(b),
+    };
     before_ok && after_ok
 }
 
 fn is_ident_char(b: u8) -> bool {
-    (b'A'..=b'Z').contains(&b)
-        || (b'a'..=b'z').contains(&b)
-        || (b'0'..=b'9').contains(&b)
-        || b == b'_'
+    b.is_ascii_alphanumeric() || b == b'_'
 }
-
 
 fn skip_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
@@ -837,11 +893,12 @@ fn extract_modifiers(source: &str, start_idx: usize) -> (String, usize) {
 }
 
 pub fn render_property_table(parsed: &ParsedRepo) -> String {
-    let mut lines = Vec::new();
-    lines.push("# Handled Functions".to_string());
-    lines.push(String::new());
-    lines.push("| Contract | Function | Signature |".to_string());
-    lines.push("| --- | --- | --- |".to_string());
+    let mut lines = vec![
+        "# Handled Functions".to_string(),
+        String::new(),
+        "| Contract | Function | Signature |".to_string(),
+        "| --- | --- | --- |".to_string(),
+    ];
 
     for contract in &parsed.contracts {
         for func in &contract.functions {
@@ -881,10 +938,7 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
     let iface_name = format!("I{}", contract.name);
     let target_name = format!("target{}", contract.name);
     let set_target_name = format!("setTarget{}", contract.name);
-    out.push_str(&format!(
-        "    {} internal {};\n\n",
-        iface_name, target_name
-    ));
+    out.push_str(&format!("    {} internal {};\n\n", iface_name, target_name));
     out.push_str(&format!(
         "    function {}({} _target) public {{\n",
         set_target_name, iface_name
@@ -892,16 +946,34 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
     out.push_str(&format!("        {} = _target;\n", target_name));
     out.push_str("    }\n\n");
 
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for func in &contract.functions {
+        *name_counts.entry(func.name.clone()).or_insert(0) += 1;
+    }
+    let mut name_seen: HashMap<String, usize> = HashMap::new();
+
     for func in &contract.functions {
         let fn_suffix = to_pascal_case(&func.name);
+        let seen = name_seen.entry(func.name.clone()).or_insert(0);
+        *seen += 1;
+        let overload_suffix = if name_counts.get(&func.name).copied().unwrap_or(0) > 1 {
+            format!("_{}", seen)
+        } else {
+            String::new()
+        };
         let params: Vec<String> = func.params.iter().map(|p| p.decl.clone()).collect();
         let args: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
         let payable = if func.payable { " payable" } else { "" };
-        let value = if func.payable { "{value: msg.value}" } else { "" };
+        let value = if func.payable {
+            "{value: msg.value}"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "    function handle{}{}({}) public{} {{\n",
+            "    function handle{}{}{}({}) public{} {{\n",
             contract.name,
             fn_suffix,
+            overload_suffix,
             params.join(", "),
             payable
         ));
