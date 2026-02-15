@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -26,7 +26,6 @@ pub struct ParsedFunction {
     pub payable: bool,
     pub signature: String,
     pub raw_call: bool,
-    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +221,17 @@ fn parse_abi_artifact(
         return Ok(None);
     }
 
+    if contract_is_abstract_from_ast(&value, contract_name).unwrap_or(false) {
+        return Ok(None);
+    }
+
+    if contract_kind_from_ast(&value, contract_name)
+        .as_deref()
+        .is_some_and(|kind| kind == "interface")
+    {
+        return Ok(None);
+    }
+
     if is_library_contract(repo_root, source_path, contract_name) {
         return Ok(None);
     }
@@ -233,14 +243,10 @@ fn parse_abi_artifact(
 
     let method_identifiers = parse_method_identifiers(&value);
     let order_map = function_order_from_ast(&value, contract_name);
-    let base_contracts = base_contract_names_from_ast(&value, contract_name);
-    let base_signatures = load_base_signatures(repo_root, config, &base_contracts);
-    let functions = parse_abi_functions(
-        abi,
-        &method_identifiers,
-        &order_map,
-        &base_signatures,
-    );
+    let functions = parse_abi_functions(abi, &method_identifiers, &order_map);
+    if functions.is_empty() {
+        return Ok(None);
+    }
     let constructor = parse_abi_constructor(abi);
     Ok(Some(ParsedContract {
         name: contract_name.to_string(),
@@ -323,7 +329,6 @@ fn parse_abi_functions(
     abi: &[Value],
     method_identifiers: &HashMap<String, String>,
     order_map: &HashMap<String, usize>,
-    base_signatures: &[(String, HashSet<String>)],
 ) -> Vec<ParsedFunction> {
     let mut ordered = Vec::new();
     for (abi_index, item) in abi.iter().enumerate() {
@@ -396,16 +401,6 @@ fn parse_abi_functions(
             .and_then(|sel| order_map.get(sel))
             .copied();
 
-        let origin = if selector.is_none() {
-            base_signatures
-                .iter()
-                .find(|(_, sigs)| sigs.contains(&signature))
-                .map(|(name, _)| name.clone())
-                .or_else(|| Some("Inherited".to_string()))
-        } else {
-            None
-        };
-
         ordered.push((
             selector,
             abi_index,
@@ -415,7 +410,6 @@ fn parse_abi_functions(
                 payable,
                 signature,
                 raw_call,
-                origin,
             },
         ));
     }
@@ -497,14 +491,9 @@ fn needs_calldata(ty: &str) -> bool {
     ty == "bytes" || ty == "string" || ty.contains('[')
 }
 
-fn base_contract_names_from_ast(value: &Value, contract_name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let Some(ast) = value.get("ast").and_then(Value::as_object) else {
-        return out;
-    };
-    let Some(nodes) = ast.get("nodes").and_then(Value::as_array) else {
-        return out;
-    };
+fn contract_kind_from_ast(value: &Value, contract_name: &str) -> Option<String> {
+    let ast = value.get("ast")?.as_object()?;
+    let nodes = ast.get("nodes")?.as_array()?;
     for node in nodes {
         if node.get("nodeType").and_then(Value::as_str) != Some("ContractDefinition") {
             continue;
@@ -512,75 +501,25 @@ fn base_contract_names_from_ast(value: &Value, contract_name: &str) -> Vec<Strin
         if node.get("name").and_then(Value::as_str) != Some(contract_name) {
             continue;
         }
-        let Some(bases) = node.get("baseContracts").and_then(Value::as_array) else {
-            break;
-        };
-        for base in bases {
-            let name = base
-                .get("baseName")
-                .and_then(Value::as_object)
-                .and_then(|obj| obj.get("name"))
-                .and_then(Value::as_str);
-            if let Some(name) = name {
-                out.push(name.to_string());
-            }
-        }
-        break;
+        return node
+            .get("contractKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
-    out
+    None
 }
 
-fn load_base_signatures(
-    repo_root: &Path,
-    config: &ForgeConfig,
-    bases: &[String],
-) -> Vec<(String, HashSet<String>)> {
-    let out_dir = repo_root.join(&config.out);
-    let mut out = Vec::new();
-    for base in bases {
-        let Some(path) = find_artifact_for_contract(&out_dir, base) else {
-            continue;
-        };
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&content) else {
-            continue;
-        };
-        let identifiers = parse_method_identifiers(&value);
-        if identifiers.is_empty() {
+fn contract_is_abstract_from_ast(value: &Value, contract_name: &str) -> Option<bool> {
+    let ast = value.get("ast")?.as_object()?;
+    let nodes = ast.get("nodes")?.as_array()?;
+    for node in nodes {
+        if node.get("nodeType").and_then(Value::as_str) != Some("ContractDefinition") {
             continue;
         }
-        let sigs: HashSet<String> = identifiers.keys().cloned().collect();
-        out.push((base.clone(), sigs));
-    }
-    out
-}
-
-fn find_artifact_for_contract(root: &Path, name: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let dir_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if dir_name == "build-info" {
-                continue;
-            }
-            if let Some(found) = find_artifact_for_contract(&path, name) {
-                return Some(found);
-            }
+        if node.get("name").and_then(Value::as_str) != Some(contract_name) {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if file_name == format!("{name}.json") {
-            return Some(path);
-        }
+        return node.get("abstract").and_then(Value::as_bool);
     }
     None
 }
@@ -741,9 +680,7 @@ pub fn render_property_table(parsed: &ParsedRepo) -> String {
 
         let mut name_counts: HashMap<String, usize> = HashMap::new();
         for func in &contract.functions {
-            *name_counts
-                .entry(handler_name_key(&func.name, func.origin.as_deref()))
-                .or_insert(0) += 1;
+            *name_counts.entry(func.name.clone()).or_insert(0) += 1;
         }
         let mut name_seen: HashMap<String, usize> = HashMap::new();
 
@@ -751,7 +688,6 @@ pub fn render_property_table(parsed: &ParsedRepo) -> String {
             let handler = handler_function_name(
                 &contract.name,
                 &func.name,
-                func.origin.as_deref(),
                 &name_counts,
                 &mut name_seen,
             );
@@ -770,9 +706,7 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
 
     let mut name_counts: HashMap<String, usize> = HashMap::new();
     for func in &contract.functions {
-        *name_counts
-            .entry(handler_name_key(&func.name, func.origin.as_deref()))
-            .or_insert(0) += 1;
+        *name_counts.entry(func.name.clone()).or_insert(0) += 1;
     }
     let mut name_seen: HashMap<String, usize> = HashMap::new();
 
@@ -788,7 +722,6 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
         let handler_name = handler_function_name(
             &contract.name,
             &func.name,
-            func.origin.as_deref(),
             &name_counts,
             &mut name_seen,
         );
@@ -860,28 +793,18 @@ pub fn build_property_body(contract: &ParsedContract) -> String {
 fn handler_function_name(
     contract_name: &str,
     func_name: &str,
-    origin: Option<&str>,
     name_counts: &HashMap<String, usize>,
     name_seen: &mut HashMap<String, usize>,
 ) -> String {
     let fn_suffix = to_pascal_case(func_name);
-    let key = handler_name_key(func_name, origin);
-    let seen = name_seen.entry(key.clone()).or_insert(0);
+    let seen = name_seen.entry(func_name.to_string()).or_insert(0);
     *seen += 1;
-    let overload_suffix = if name_counts.get(&key).copied().unwrap_or(0) > 1 {
+    let overload_suffix = if name_counts.get(func_name).copied().unwrap_or(0) > 1 {
         format!("_{}", seen)
     } else {
         String::new()
     };
-    let base = match origin {
-        Some(origin) if !origin.is_empty() => format!("{contract_name}{origin}"),
-        _ => contract_name.to_string(),
-    };
-    format!("handle{}{}{}", base, fn_suffix, overload_suffix)
-}
-
-fn handler_name_key(func_name: &str, origin: Option<&str>) -> String {
-    format!("{}|{}", func_name, origin.unwrap_or(""))
+    format!("handle{}{}{}", contract_name, fn_suffix, overload_suffix)
 }
 
 fn uint_type_for_bound(ty: &str) -> Option<String> {
@@ -990,41 +913,35 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_abi_functions_marks_inherited_origin() {
-        let abi = vec![json!({
-            "type": "function",
-            "name": "withdraw",
-            "stateMutability": "nonpayable",
-            "inputs": [
-                {"type": "uint256"},
-                {"type": "address"},
-                {"type": "address"}
-            ]
-        })];
+    fn test_contract_kind_and_abstract_from_ast() {
+        let value = json!({
+            "ast": {
+                "nodes": [
+                    {
+                        "nodeType": "ContractDefinition",
+                        "name": "Iface",
+                        "contractKind": "interface",
+                        "abstract": true
+                    },
+                    {
+                        "nodeType": "ContractDefinition",
+                        "name": "Concrete",
+                        "contractKind": "contract",
+                        "abstract": false
+                    }
+                ]
+            }
+        });
 
-        let method_identifiers = HashMap::new();
-        let order_map = HashMap::new();
-        let mut sigs = HashSet::new();
-        sigs.insert("withdraw(uint256,address,address)".to_string());
-        let base_signatures = vec![("ERC4626".to_string(), sigs)];
-
-        let functions = parse_abi_functions(&abi, &method_identifiers, &order_map, &base_signatures);
-        assert_eq!(functions.len(), 1);
-        assert_eq!(functions[0].origin.as_deref(), Some("ERC4626"));
-    }
-
-    #[test]
-    fn test_handler_function_name_with_origin() {
-        let mut counts = HashMap::new();
-        counts.insert(handler_name_key("transfer", Some("ERC4626")), 1);
-        let mut seen = HashMap::new();
-        let name = handler_function_name(
-            "BriVault",
-            "transfer",
-            Some("ERC4626"),
-            &counts,
-            &mut seen,
+        assert_eq!(
+            contract_kind_from_ast(&value, "Iface").as_deref(),
+            Some("interface")
         );
-        assert_eq!(name, "handleBriVaultERC4626Transfer");
+        assert_eq!(contract_is_abstract_from_ast(&value, "Iface"), Some(true));
+        assert_eq!(
+            contract_kind_from_ast(&value, "Concrete").as_deref(),
+            Some("contract")
+        );
+        assert_eq!(contract_is_abstract_from_ast(&value, "Concrete"), Some(false));
     }
 }

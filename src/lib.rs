@@ -37,7 +37,7 @@ fn parse_entry_imports(properties: &[Contract]) -> String {
     properties.iter().fold(String::new(), |mut output, b| {
         let _ = writeln!(
             output,
-            "import {{ {} }} from './properties/{}.t.sol';",
+            "import {{ {} }} from \"./properties/{}.t.sol\";",
             b.name, b.name
         );
         output
@@ -596,7 +596,7 @@ fn create_property_contracts_from_parsed(
         let name = format!("{}{}", ContractType::Property.name(), contract.name);
         let handler_name = handler_name_for(&contract.name);
         let imports = format!(
-            "import {{ {} }} from '../handlers/{}.t.sol';\n",
+            "import {{ {} }} from \"../handlers/{}.t.sol\";\n",
             handler_name, handler_name
         );
         let property_contract = ContractBuilder::new()
@@ -788,7 +788,7 @@ mod tests {
 
         assert_eq!(
             parse_entry_imports(props.as_ref()),
-            "import { PropertiesA } from './properties/PropertiesA.t.sol';\n"
+            "import { PropertiesA } from \"./properties/PropertiesA.t.sol\";\n"
         );
     }
 

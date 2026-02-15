@@ -136,7 +136,7 @@ impl ContractType {
 
     pub fn import(&self) -> &'static str {
         match self {
-            ContractType::Handler => "import {Setup} from '../Setup.t.sol';\n",
+            ContractType::Handler => "import {Setup} from \"../Setup.t.sol\";\n",
             ContractType::Property => "",
             ContractType::EntryPoint => "",
             ContractType::Setup => "",
