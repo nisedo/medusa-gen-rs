@@ -3,5 +3,5 @@ pragma solidity {{ solc }};
 
 {{ imports }}
 contract {{ name }} {% if parents != "" %}is {{parents}} {% endif %}{
-
+{{ body }}
 }

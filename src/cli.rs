@@ -31,13 +31,17 @@ pub struct Args {
     #[arg(short, long, default_value = "0.8.23")]
     pub solc: String,
 
-    /// Number of handler to generate
+    /// Number of handler to generate (ignored; handlers are derived from the repo)
     #[arg(short = 'n', long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..))]
     pub nb_handlers: u8,
 
-    /// Number of properties contract to generate
+    /// Number of properties contract to generate (ignored; properties are derived from the repo)
     #[arg(short = 'p', long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..))]
     pub nb_properties: u8,
+
+    /// Exclude script contracts from parsed projects (e.g. Foundry script/)
+    #[arg(long, default_value_t = true)]
+    pub exclude_scripts: bool,
 
     /// Overwrite existing files
     #[arg(short, long, default_value_t = false)]

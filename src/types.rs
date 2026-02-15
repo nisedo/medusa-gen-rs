@@ -13,6 +13,7 @@ pub struct Contract {
     pub imports: String,
     pub name: String,
     pub parents: String,
+    pub body: String,
 }
 
 impl Contract {
@@ -38,6 +39,7 @@ pub struct ContractBuilder {
     imports: String,
     name: String,
     parents: String,
+    body: String,
 }
 
 impl ContractBuilder {
@@ -48,6 +50,7 @@ impl ContractBuilder {
             imports: String::from(""),
             name: String::from(""),
             parents: String::from(""),
+            body: String::from(""),
         }
     }
 
@@ -66,6 +69,16 @@ impl ContractBuilder {
         self
     }
 
+    pub fn with_body(mut self, body: String) -> Self {
+        self.body = body;
+        self
+    }
+
+    pub fn with_solc(mut self, solc: String) -> Self {
+        self.solc = solc;
+        self
+    }
+
     pub fn with_type(mut self, contract_type: &ContractType) -> Self {
         self.imports = contract_type.import().to_owned();
         self.name = contract_type.name().to_owned();
@@ -80,6 +93,7 @@ impl ContractBuilder {
             imports: self.imports,
             name: self.name,
             parents: self.parents,
+            body: self.body,
         }
     }
 }
