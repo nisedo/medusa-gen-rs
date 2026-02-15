@@ -9,9 +9,9 @@ use clap::{crate_authors, Parser};
     long_about = None,
 )]
 pub struct Args {
-    /// Solidity version
-    #[arg(short, long, default_value = "0.8.23")]
-    pub solc: String,
+    /// Solidity version to emit (defaults to forge config solc_version)
+    #[arg(short, long)]
+    pub solc: Option<String>,
 
     /// Exclude script contracts from parsed projects (e.g. Foundry script/)
     #[arg(long, default_value_t = true)]

@@ -14,6 +14,7 @@ pub struct Contract {
     pub name: String,
     pub parents: String,
     pub body: String,
+    pub is_abstract: bool,
 }
 
 impl Contract {
@@ -40,6 +41,7 @@ pub struct ContractBuilder {
     name: String,
     parents: String,
     body: String,
+    is_abstract: bool,
 }
 
 impl ContractBuilder {
@@ -51,6 +53,7 @@ impl ContractBuilder {
             name: String::from(""),
             parents: String::from(""),
             body: String::from(""),
+            is_abstract: false,
         }
     }
 
@@ -74,6 +77,11 @@ impl ContractBuilder {
         self
     }
 
+    pub fn with_abstract(mut self, is_abstract: bool) -> Self {
+        self.is_abstract = is_abstract;
+        self
+    }
+
     pub fn with_solc(mut self, solc: String) -> Self {
         self.solc = solc;
         self
@@ -94,6 +102,7 @@ impl ContractBuilder {
             name: self.name,
             parents: self.parents,
             body: self.body,
+            is_abstract: self.is_abstract,
         }
     }
 }

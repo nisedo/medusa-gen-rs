@@ -8,12 +8,15 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub struct ParsedRepo {
     pub contracts: Vec<ParsedContract>,
+    pub from_abi: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedContract {
     pub name: String,
     pub functions: Vec<ParsedFunction>,
+    pub constructor: Option<ParsedConstructor>,
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,7 @@ pub struct ParsedFunction {
     pub payable: bool,
     pub signature: String,
     pub raw_call: bool,
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,83 +36,19 @@ pub struct FunctionParam {
     pub ty: String,
 }
 
-const SKIP_DIRS: [&str; 11] = [
-    ".git",
-    "node_modules",
-    "lib",
-    "test",
-    "tests",
-    "out",
-    "cache",
-    "artifacts",
-    "build",
-    "dist",
-    "target",
-];
+#[derive(Debug, Clone)]
+pub struct ParsedConstructor {
+    pub params: Vec<FunctionParam>,
+}
 
 pub fn parse_repo(root: &Path, exclude_scripts: bool) -> Result<ParsedRepo> {
-    match parse_repo_from_abi(root, exclude_scripts) {
-        Ok(parsed) if !parsed.contracts.is_empty() => return Ok(parsed),
-        Ok(_) => {
-            eprintln!("ABI parsing returned no contracts; falling back to source parsing.");
-        }
-        Err(err) => {
-            eprintln!("ABI parsing failed ({err}); falling back to source parsing.");
-        }
+    let parsed = parse_repo_from_abi(root, exclude_scripts)?;
+    if parsed.contracts.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No contracts found. medusa-gen only supports Foundry projects; make sure `forge build` succeeds and produces artifacts."
+        ));
     }
-    parse_repo_from_source(root, exclude_scripts)
-}
-
-fn parse_repo_from_source(root: &Path, exclude_scripts: bool) -> Result<ParsedRepo> {
-    let mut contracts = Vec::new();
-    let mut seen = HashSet::new();
-    let source_root = pick_source_root(root);
-    visit_dir(
-        source_root.as_path(),
-        &mut contracts,
-        &mut seen,
-        exclude_scripts,
-    )?;
-    contracts.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ParsedRepo { contracts })
-}
-
-fn pick_source_root(root: &Path) -> PathBuf {
-    let src = root.join("src");
-    if src.is_dir() && dir_contains_sol(&src) {
-        return src;
-    }
-    root.to_path_buf()
-}
-
-fn dir_contains_sol(root: &Path) -> bool {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if SKIP_DIRS.iter().any(|skip| skip == &name) {
-                continue;
-            }
-            if dir_contains_sol(&path) {
-                return true;
-            }
-            continue;
-        }
-
-        if path.extension().and_then(|e| e.to_str()) == Some("sol") {
-            return true;
-        }
-    }
-
-    false
+    Ok(parsed)
 }
 
 struct ForgeConfig {
@@ -147,7 +87,10 @@ fn parse_repo_from_abi(root: &Path, exclude_scripts: bool) -> Result<ParsedRepo>
     )?;
     contracts.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(ParsedRepo { contracts })
+    Ok(ParsedRepo {
+        contracts,
+        from_abi: true,
+    })
 }
 
 fn read_forge_config(root: &Path) -> Result<ForgeConfig> {
@@ -288,16 +231,102 @@ fn parse_abi_artifact(
         None => return Ok(None),
     };
 
-    let functions = parse_abi_functions(abi);
+    let method_identifiers = parse_method_identifiers(&value);
+    let order_map = function_order_from_ast(&value, contract_name);
+    let base_contracts = base_contract_names_from_ast(&value, contract_name);
+    let base_signatures = load_base_signatures(repo_root, config, &base_contracts);
+    let functions = parse_abi_functions(
+        abi,
+        &method_identifiers,
+        &order_map,
+        &base_signatures,
+    );
+    let constructor = parse_abi_constructor(abi);
     Ok(Some(ParsedContract {
         name: contract_name.to_string(),
         functions,
+        constructor,
+        source_path: Some(source_path.to_string()),
     }))
 }
 
-fn parse_abi_functions(abi: &[Value]) -> Vec<ParsedFunction> {
-    let mut functions = Vec::new();
-    for item in abi {
+fn parse_method_identifiers(value: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(obj) = value.get("methodIdentifiers").and_then(Value::as_object) else {
+        return out;
+    };
+    for (signature, selector) in obj {
+        if let Some(selector) = selector.as_str() {
+            out.insert(signature.clone(), selector.to_lowercase());
+        }
+    }
+    out
+}
+
+fn function_order_from_ast(value: &Value, contract_name: &str) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let Some(ast) = value.get("ast").and_then(Value::as_object) else {
+        return out;
+    };
+    let Some(nodes) = ast.get("nodes").and_then(Value::as_array) else {
+        return out;
+    };
+
+    let mut contract_nodes: Option<&Vec<Value>> = None;
+    for node in nodes {
+        if node.get("nodeType").and_then(Value::as_str) != Some("ContractDefinition") {
+            continue;
+        }
+        if node.get("name").and_then(Value::as_str) != Some(contract_name) {
+            continue;
+        }
+        if let Some(children) = node.get("nodes").and_then(Value::as_array) {
+            contract_nodes = Some(children);
+            break;
+        }
+    }
+
+    let Some(contract_nodes) = contract_nodes else {
+        return out;
+    };
+
+    let mut idx = 0usize;
+    for node in contract_nodes {
+        if node.get("nodeType").and_then(Value::as_str) != Some("FunctionDefinition") {
+            continue;
+        }
+        if node.get("kind").and_then(Value::as_str) != Some("function") {
+            continue;
+        }
+        let visibility = node.get("visibility").and_then(Value::as_str).unwrap_or("");
+        if visibility != "public" && visibility != "external" {
+            continue;
+        }
+        let state = node
+            .get("stateMutability")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if state == "view" || state == "pure" {
+            continue;
+        }
+        let selector = match node.get("functionSelector").and_then(Value::as_str) {
+            Some(selector) if !selector.is_empty() => selector.to_lowercase(),
+            _ => continue,
+        };
+        out.insert(selector, idx);
+        idx += 1;
+    }
+    out
+}
+
+fn parse_abi_functions(
+    abi: &[Value],
+    method_identifiers: &HashMap<String, String>,
+    order_map: &HashMap<String, usize>,
+    base_signatures: &[(String, HashSet<String>)],
+) -> Vec<ParsedFunction> {
+    let mut ordered = Vec::new();
+    for (abi_index, item) in abi.iter().enumerate() {
         let kind = match item.get("type").and_then(Value::as_str) {
             Some(kind) => kind,
             None => continue,
@@ -362,15 +391,79 @@ fn parse_abi_functions(abi: &[Value]) -> Vec<ParsedFunction> {
                 .collect()
         };
 
-        functions.push(ParsedFunction {
-            name,
-            params,
-            payable,
-            signature,
-            raw_call,
-        });
+        let selector = method_identifiers
+            .get(&signature)
+            .and_then(|sel| order_map.get(sel))
+            .copied();
+
+        let origin = if selector.is_none() {
+            base_signatures
+                .iter()
+                .find(|(_, sigs)| sigs.contains(&signature))
+                .map(|(name, _)| name.clone())
+                .or_else(|| Some("Inherited".to_string()))
+        } else {
+            None
+        };
+
+        ordered.push((
+            selector,
+            abi_index,
+            ParsedFunction {
+                name,
+                params,
+                payable,
+                signature,
+                raw_call,
+                origin,
+            },
+        ));
     }
-    functions
+
+    ordered.sort_by(|a, b| match (a.0, b.0) {
+        (Some(a_idx), Some(b_idx)) => a_idx.cmp(&b_idx),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+
+    ordered.into_iter().map(|(_, _, f)| f).collect()
+}
+
+fn parse_abi_constructor(abi: &[Value]) -> Option<ParsedConstructor> {
+    for item in abi {
+        let kind = match item.get("type").and_then(Value::as_str) {
+            Some(kind) => kind,
+            None => continue,
+        };
+        if kind != "constructor" {
+            continue;
+        }
+        let inputs = match item.get("inputs").and_then(Value::as_array) {
+            Some(inputs) => inputs.as_slice(),
+            None => &[],
+        };
+        let params: Vec<FunctionParam> = inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, input)| {
+                let ty = abi_type_signature(input)?;
+                let name = input
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("arg{}", idx));
+                let decl = format!("{} {}", ty, name);
+                Some(FunctionParam { decl, name, ty })
+            })
+            .collect();
+        if params.is_empty() {
+            return None;
+        }
+        return Some(ParsedConstructor { params });
+    }
+    None
 }
 
 fn abi_type_signature(input: &Value) -> Option<String> {
@@ -404,6 +497,94 @@ fn needs_calldata(ty: &str) -> bool {
     ty == "bytes" || ty == "string" || ty.contains('[')
 }
 
+fn base_contract_names_from_ast(value: &Value, contract_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(ast) = value.get("ast").and_then(Value::as_object) else {
+        return out;
+    };
+    let Some(nodes) = ast.get("nodes").and_then(Value::as_array) else {
+        return out;
+    };
+    for node in nodes {
+        if node.get("nodeType").and_then(Value::as_str) != Some("ContractDefinition") {
+            continue;
+        }
+        if node.get("name").and_then(Value::as_str) != Some(contract_name) {
+            continue;
+        }
+        let Some(bases) = node.get("baseContracts").and_then(Value::as_array) else {
+            break;
+        };
+        for base in bases {
+            let name = base
+                .get("baseName")
+                .and_then(Value::as_object)
+                .and_then(|obj| obj.get("name"))
+                .and_then(Value::as_str);
+            if let Some(name) = name {
+                out.push(name.to_string());
+            }
+        }
+        break;
+    }
+    out
+}
+
+fn load_base_signatures(
+    repo_root: &Path,
+    config: &ForgeConfig,
+    bases: &[String],
+) -> Vec<(String, HashSet<String>)> {
+    let out_dir = repo_root.join(&config.out);
+    let mut out = Vec::new();
+    for base in bases {
+        let Some(path) = find_artifact_for_contract(&out_dir, base) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let identifiers = parse_method_identifiers(&value);
+        if identifiers.is_empty() {
+            continue;
+        }
+        let sigs: HashSet<String> = identifiers.keys().cloned().collect();
+        out.push((base.clone(), sigs));
+    }
+    out
+}
+
+fn find_artifact_for_contract(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if dir_name == "build-info" {
+                continue;
+            }
+            if let Some(found) = find_artifact_for_contract(&path, name) {
+                return Some(found);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name == format!("{name}.json") {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn is_library_contract(root: &Path, source_path: &str, contract_name: &str) -> bool {
     let path = root.join(source_path);
     let source = match fs::read_to_string(&path) {
@@ -430,109 +611,6 @@ fn is_library_contract(root: &Path, source_path: &str, contract_name: &str) -> b
         idx = i;
     }
     false
-}
-
-fn visit_dir(
-    root: &Path,
-    contracts: &mut Vec<ParsedContract>,
-    seen: &mut HashSet<String>,
-    exclude_scripts: bool,
-) -> Result<()> {
-    let entries =
-        fs::read_dir(root).with_context(|| format!("Failed to read dir {}", root.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if SKIP_DIRS.iter().any(|skip| skip == &name) {
-                continue;
-            }
-            if exclude_scripts && (name == "script" || name == "scripts") {
-                continue;
-            }
-            visit_dir(&path, contracts, seen, exclude_scripts)?;
-            continue;
-        }
-
-        if path.extension().and_then(|e| e.to_str()) != Some("sol") {
-            continue;
-        }
-
-        for contract in parse_sol_file(&path)? {
-            if exclude_scripts && contract.name.ends_with("Script") {
-                continue;
-            }
-            if seen.insert(contract.name.clone()) {
-                contracts.push(contract);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_sol_file(path: &Path) -> Result<Vec<ParsedContract>> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read solidity file {}", path.display()))?;
-    let stripped = strip_comments(&source);
-
-    let mut contracts = Vec::new();
-    let mut idx = 0usize;
-    while idx < stripped.len() {
-        let contract_pos = find_keyword(&stripped, idx, "contract");
-        let library_pos = find_keyword(&stripped, idx, "library");
-        let interface_pos = find_keyword(&stripped, idx, "interface");
-        let mut next: Option<(usize, &str)> = None;
-        for (pos, keyword) in [
-            (contract_pos, "contract"),
-            (library_pos, "library"),
-            (interface_pos, "interface"),
-        ] {
-            if let Some(pos) = pos {
-                let should_take = match &next {
-                    None => true,
-                    Some((best, _)) => pos < *best,
-                };
-                if should_take {
-                    next = Some((pos, keyword));
-                }
-            }
-        }
-        let (pos, keyword) = match next {
-            Some(next) => next,
-            None => break,
-        };
-        let keyword_len = keyword.len();
-
-        if keyword == "interface" {
-            idx = pos + keyword_len;
-            continue;
-        }
-
-        let mut i = pos + keyword_len;
-        i = skip_whitespace(stripped.as_bytes(), i);
-        let name_start = i;
-        while i < stripped.len() && is_ident_char(stripped.as_bytes()[i]) {
-            i += 1;
-        }
-        if name_start == i {
-            idx = pos + keyword_len;
-            continue;
-        }
-
-        let name = stripped[name_start..i].trim().to_string();
-        if let Some(body) = extract_block(&stripped, i) {
-            let functions = parse_functions(body);
-            contracts.push(ParsedContract { name, functions });
-        }
-        idx = i;
-    }
-
-    Ok(contracts)
 }
 
 fn strip_comments(source: &str) -> String {
@@ -605,209 +683,6 @@ fn strip_comments(source: &str) -> String {
     out
 }
 
-fn extract_block(source: &str, start_idx: usize) -> Option<&str> {
-    let brace_pos = source[start_idx..].find('{')? + start_idx;
-    let mut depth = 0usize;
-    let mut end_idx = None;
-    for (offset, ch) in source[brace_pos..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    end_idx = Some(brace_pos + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    end_idx.map(|end| &source[brace_pos + 1..end])
-}
-
-fn parse_functions(body: &str) -> Vec<ParsedFunction> {
-    let mut functions = Vec::new();
-    let mut idx = 0usize;
-    let body_bytes = body.as_bytes();
-
-    while let Some(pos) = find_keyword(body, idx, "function") {
-        let mut i = pos + "function".len();
-        i = skip_whitespace(body_bytes, i);
-        if i >= body_bytes.len() {
-            break;
-        }
-        if body_bytes[i] == b'(' {
-            idx = i + 1;
-            continue;
-        }
-        let name_start = i;
-        while i < body_bytes.len() && is_ident_char(body_bytes[i]) {
-            i += 1;
-        }
-        if name_start == i {
-            idx = i + 1;
-            continue;
-        }
-        let name = body[name_start..i].trim().to_string();
-        if name == "constructor" || name == "fallback" || name == "receive" {
-            idx = i + 1;
-            continue;
-        }
-        i = skip_whitespace(body_bytes, i);
-        if i >= body_bytes.len() || body_bytes[i] != b'(' {
-            idx = i + 1;
-            continue;
-        }
-
-        let (params_str, after_params) = match extract_parens(body, i) {
-            Some(v) => v,
-            None => {
-                idx = i + 1;
-                continue;
-            }
-        };
-
-        let (modifiers, after_modifiers) = extract_modifiers(body, after_params);
-        let (is_public, is_external, is_internal_private, is_view_pure, is_payable) =
-            analyze_modifiers(&modifiers);
-
-        if is_internal_private || (!is_public && !is_external) || is_view_pure {
-            idx = after_modifiers;
-            continue;
-        }
-
-        let params = parse_params(params_str);
-        let signature = signature_from_params(&name, &params);
-        functions.push(ParsedFunction {
-            name,
-            params,
-            payable: is_payable,
-            signature,
-            raw_call: false,
-        });
-
-        idx = after_modifiers;
-    }
-
-    functions
-}
-
-fn analyze_modifiers(modifiers: &str) -> (bool, bool, bool, bool, bool) {
-    let mut is_public = false;
-    let mut is_external = false;
-    let mut is_internal_private = false;
-    let mut is_view_pure = false;
-    let mut is_payable = false;
-
-    for token in modifiers.split_whitespace() {
-        match token {
-            "public" => is_public = true,
-            "external" => is_external = true,
-            "internal" | "private" => is_internal_private = true,
-            "view" | "pure" | "constant" => is_view_pure = true,
-            "payable" => is_payable = true,
-            _ => {}
-        }
-    }
-
-    (
-        is_public,
-        is_external,
-        is_internal_private,
-        is_view_pure,
-        is_payable,
-    )
-}
-
-fn parse_params(params: &str) -> Vec<FunctionParam> {
-    let parts = split_params(params);
-    let mut params_out = Vec::new();
-
-    for (idx, param) in parts.into_iter().enumerate() {
-        if let Some(parsed) = parse_param(&param, idx) {
-            params_out.push(parsed);
-        }
-    }
-
-    params_out
-}
-
-fn split_params(params: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut paren_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    for (i, ch) in params.char_indices() {
-        match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ',' if paren_depth == 0 && bracket_depth == 0 => {
-                parts.push(params[start..i].trim().to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = params[start..].trim();
-    if !tail.is_empty() {
-        parts.push(tail.to_string());
-    }
-    parts
-}
-
-fn parse_param(param: &str, idx: usize) -> Option<FunctionParam> {
-    let param = param.trim();
-    if param.is_empty() {
-        return None;
-    }
-
-    let data_location = ["memory", "calldata", "storage", "payable"];
-    let mut name: Option<String> = None;
-
-    if param.chars().any(|c| c.is_whitespace()) {
-        if let Some(last) = param.split_whitespace().last() {
-            if !data_location.contains(&last) && !param.ends_with(')') && !param.ends_with(']') {
-                name = Some(last.to_string());
-            }
-        }
-    }
-
-    let (ty, name) = if let Some(name) = name {
-        let name_pos = param.rfind(&name).unwrap_or(param.len());
-        let ty = param[..name_pos].trim_end().to_string();
-        let ty = if ty.is_empty() { param.to_string() } else { ty };
-        (ty, name)
-    } else {
-        (param.to_string(), format!("arg{}", idx))
-    };
-
-    let decl = if ty.is_empty() {
-        name.clone()
-    } else {
-        format!("{} {}", ty, name)
-    };
-
-    Some(FunctionParam { decl, name, ty })
-}
-
-fn signature_from_params(name: &str, params: &[FunctionParam]) -> String {
-    let types: Vec<String> = params.iter().map(|p| canonicalize_type(&p.ty)).collect();
-    format!("{}({})", name, types.join(","))
-}
-
-fn canonicalize_type(ty: &str) -> String {
-    let mut parts = Vec::new();
-    for token in ty.split_whitespace() {
-        if matches!(token, "memory" | "calldata" | "storage" | "payable") {
-            continue;
-        }
-        parts.push(token);
-    }
-    parts.join("")
-}
-
 fn find_keyword(haystack: &str, start: usize, keyword: &str) -> Option<usize> {
     let mut idx = start;
     while let Some(pos) = haystack[idx..].find(keyword) {
@@ -855,112 +730,53 @@ fn skip_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     idx
 }
 
-fn extract_parens(source: &str, open_idx: usize) -> Option<(&str, usize)> {
-    let mut depth = 0usize;
-    let mut end_idx = None;
-    for (offset, ch) in source[open_idx..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    end_idx = Some(open_idx + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end_idx?;
-    Some((&source[open_idx + 1..end], end + 1))
-}
-
-fn extract_modifiers(source: &str, start_idx: usize) -> (String, usize) {
-    let mut depth = 0usize;
-    let mut end = source.len();
-    for (offset, ch) in source[start_idx..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '{' | ';' if depth == 0 => {
-                end = start_idx + offset;
-                break;
-            }
-            _ => {}
-        }
-    }
-    (source[start_idx..end].trim().to_string(), end)
-}
-
 pub fn render_property_table(parsed: &ParsedRepo) -> String {
-    let mut lines = vec![
-        "# Handled Functions".to_string(),
-        String::new(),
-        "| Contract | Function | Signature |".to_string(),
-        "| --- | --- | --- |".to_string(),
-    ];
+    let mut lines = vec!["# Handled Functions".to_string(), String::new()];
 
     for contract in &parsed.contracts {
+        lines.push(format!("## {}", contract.name));
+        lines.push(String::new());
+        lines.push("| Handler | Signature |".to_string());
+        lines.push("| --- | --- |".to_string());
+
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
         for func in &contract.functions {
-            lines.push(format!(
-                "| {} | {} | `{}` |",
-                contract.name, func.name, func.signature
-            ));
+            *name_counts
+                .entry(handler_name_key(&func.name, func.origin.as_deref()))
+                .or_insert(0) += 1;
         }
+        let mut name_seen: HashMap<String, usize> = HashMap::new();
+
+        for func in &contract.functions {
+            let handler = handler_function_name(
+                &contract.name,
+                &func.name,
+                func.origin.as_deref(),
+                &name_counts,
+                &mut name_seen,
+            );
+            lines.push(format!("| `{}` | `{}` |", handler, func.signature));
+        }
+
+        lines.push(String::new());
     }
 
     lines.join("\n")
 }
 
-pub fn build_handler_interface(contract: &ParsedContract) -> String {
-    let mut out = String::new();
-    let iface_name = format!("I{}", contract.name);
-    out.push_str(&format!("interface {} {{\n", iface_name));
-    for func in &contract.functions {
-        if func.raw_call {
-            continue;
-        }
-        let params: Vec<String> = func.params.iter().map(|p| p.decl.clone()).collect();
-        let payable = if func.payable { " payable" } else { "" };
-        out.push_str(&format!(
-            "    function {}({}) external{};\n",
-            func.name,
-            params.join(", "),
-            payable
-        ));
-    }
-    out.push_str("}\n");
-    out
-}
-
 pub fn build_handler_body(contract: &ParsedContract) -> String {
     let mut out = String::new();
-    let iface_name = format!("I{}", contract.name);
-    let target_name = format!("target{}", contract.name);
-    let set_target_name = format!("setTarget{}", contract.name);
-    out.push_str(&format!("    {} internal {};\n\n", iface_name, target_name));
-    out.push_str(&format!(
-        "    function {}({} _target) public {{\n",
-        set_target_name, iface_name
-    ));
-    out.push_str(&format!("        {} = _target;\n", target_name));
-    out.push_str("    }\n\n");
+    let target_name = contract_instance_name(&contract.name);
 
     let mut name_counts: HashMap<String, usize> = HashMap::new();
     for func in &contract.functions {
-        *name_counts.entry(func.name.clone()).or_insert(0) += 1;
+        *name_counts
+            .entry(handler_name_key(&func.name, func.origin.as_deref()))
+            .or_insert(0) += 1;
     }
     let mut name_seen: HashMap<String, usize> = HashMap::new();
 
     for func in &contract.functions {
-        let fn_suffix = to_pascal_case(&func.name);
-        let seen = name_seen.entry(func.name.clone()).or_insert(0);
-        *seen += 1;
-        let overload_suffix = if name_counts.get(&func.name).copied().unwrap_or(0) > 1 {
-            format!("_{}", seen)
-        } else {
-            String::new()
-        };
         let params: Vec<String> = func.params.iter().map(|p| p.decl.clone()).collect();
         let args: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
         let payable = if func.payable { " payable" } else { "" };
@@ -969,14 +785,31 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
         } else {
             ""
         };
+        let handler_name = handler_function_name(
+            &contract.name,
+            &func.name,
+            func.origin.as_deref(),
+            &name_counts,
+            &mut name_seen,
+        );
         out.push_str(&format!(
-            "    function handle{}{}{}({}) public{} {{\n",
-            contract.name,
-            fn_suffix,
-            overload_suffix,
+            "    function {}({}) public{} {{\n",
+            handler_name,
             params.join(", "),
             payable
         ));
+        out.push_str("        vm.prank(msg.sender);\n");
+        if !args.is_empty() {
+            out.push_str("        // TODO: add vm.assume(...) to constrain inputs\n");
+            for param in &func.params {
+                if let Some(uint_ty) = uint_type_for_bound(&param.ty) {
+                    out.push_str(&format!(
+                        "        // {} = bound({}, 0, type({}).max);\n",
+                        param.name, param.name, uint_ty
+                    ));
+                }
+            }
+        }
         if func.raw_call {
             let data_name = func
                 .params
@@ -992,10 +825,7 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
             continue;
         }
         if args.is_empty() {
-            out.push_str(&format!(
-                "        {}.{}{}();\n",
-                target_name, func.name, value
-            ));
+            out.push_str(&format!("        {}.{}{}();\n", target_name, func.name, value));
         } else {
             out.push_str(&format!(
                 "        {}.{}{}({});\n",
@@ -1009,6 +839,76 @@ pub fn build_handler_body(contract: &ParsedContract) -> String {
     }
 
     out.trim_end().to_string()
+}
+
+pub fn build_property_body(contract: &ParsedContract) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "    // TODO: add invariants for {}\n",
+        contract.name
+    ));
+    out.push_str(&format!(
+        "    function property_{}_TODO() public returns (bool) {{\n",
+        contract.name
+    ));
+    out.push_str("        // TODO: implement invariants\n");
+    out.push_str("        return true;\n");
+    out.push_str("    }\n");
+    out.trim_end().to_string()
+}
+
+fn handler_function_name(
+    contract_name: &str,
+    func_name: &str,
+    origin: Option<&str>,
+    name_counts: &HashMap<String, usize>,
+    name_seen: &mut HashMap<String, usize>,
+) -> String {
+    let fn_suffix = to_pascal_case(func_name);
+    let key = handler_name_key(func_name, origin);
+    let seen = name_seen.entry(key.clone()).or_insert(0);
+    *seen += 1;
+    let overload_suffix = if name_counts.get(&key).copied().unwrap_or(0) > 1 {
+        format!("_{}", seen)
+    } else {
+        String::new()
+    };
+    let base = match origin {
+        Some(origin) if !origin.is_empty() => format!("{contract_name}{origin}"),
+        _ => contract_name.to_string(),
+    };
+    format!("handle{}{}{}", base, fn_suffix, overload_suffix)
+}
+
+fn handler_name_key(func_name: &str, origin: Option<&str>) -> String {
+    format!("{}|{}", func_name, origin.unwrap_or(""))
+}
+
+fn uint_type_for_bound(ty: &str) -> Option<String> {
+    let canonical = canonicalize_type(ty);
+    if canonical.contains('[') {
+        return None;
+    }
+    let rest = canonical.strip_prefix("uint")?;
+    if rest.is_empty() {
+        return Some("uint256".to_string());
+    }
+    if rest.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(format!("uint{}", rest));
+    }
+    None
+}
+
+fn contract_instance_name(name: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in name.chars().enumerate() {
+        if idx == 0 {
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn to_pascal_case(input: &str) -> String {
@@ -1027,4 +927,15 @@ fn to_pascal_case(input: &str) -> String {
         }
     }
     out
+}
+
+fn canonicalize_type(ty: &str) -> String {
+    let mut parts = Vec::new();
+    for token in ty.split_whitespace() {
+        if matches!(token, "memory" | "calldata" | "storage" | "payable") {
+            continue;
+        }
+        parts.push(token);
+    }
+    parts.join("")
 }

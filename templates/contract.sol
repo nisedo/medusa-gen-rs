@@ -2,6 +2,6 @@
 pragma solidity {{ solc }};
 
 {{ imports }}
-contract {{ name }} {% if parents != "" %}is {{parents}} {% endif %}{
+{% if is_abstract %}abstract {% endif %}contract {{ name }} {% if parents != "" %}is {{parents}} {% endif %}{
 {{ body }}
 }

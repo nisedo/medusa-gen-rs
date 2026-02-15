@@ -4,17 +4,20 @@ mod types;
 
 use crate::cli::Args;
 use crate::parser::{
-    build_handler_body, build_handler_interface, parse_repo, render_property_table, ParsedContract,
+    build_handler_body, build_property_body, parse_repo, render_property_table, ParsedContract,
     ParsedRepo,
 };
 use crate::types::{Contract, ContractBuilder, ContractType};
 
 use anyhow::{Context, Result};
 use fs_extra::dir::{copy, CopyOptions};
+use serde_json::Value;
 use std::fmt::Write;
 use std::fs::{self, DirBuilder};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::TempDir;
+use std::{collections::HashSet};
 
 /// Create the "import { HandlerA, HandlerB } from './handlers/HandlersParent.t.sol';" from a vec of parent contracts
 fn parse_child_imports(parents: &[Contract]) -> String {
@@ -41,23 +44,193 @@ fn build_setup_body(parsed: &ParsedRepo) -> String {
     let mut out = String::new();
     out.push_str("    // Target contracts\n");
     for contract in &parsed.contracts {
+        let instance = contract_instance_name(&contract.name);
         out.push_str(&format!(
-            "    address internal setupTarget{};\n",
-            contract.name
+            "    {} internal {};\n",
+            contract.name, instance
         ));
     }
 
     out.push_str("\n    function setUp() public virtual {\n");
     out.push_str("        // TODO: deploy and initialize target contracts\n");
     for contract in &parsed.contracts {
-        out.push_str(&format!(
-            "        // setupTarget{} = address(new {}(/* ... */));\n",
-            contract.name, contract.name
-        ));
+        let instance = contract_instance_name(&contract.name);
+        let constructor_params = contract
+            .constructor
+            .as_ref()
+            .map(|constructor| {
+                constructor
+                    .params
+                    .iter()
+                    .map(|param| param.decl.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|params| !params.is_empty());
+        let can_autodeploy = parsed.from_abi && constructor_params.is_none();
+        if can_autodeploy {
+            out.push_str(&format!(
+                "        {} = new {}();\n",
+                instance, contract.name
+            ));
+            continue;
+        }
+        if let Some(params) = constructor_params {
+            out.push_str(&format!(
+                "        // {} = new {}(/* {} */);\n",
+                instance, contract.name, params
+            ));
+        } else {
+            out.push_str(&format!(
+                "        // {} = new {}(/* ... */);\n",
+                instance, contract.name
+            ));
+        }
+    }
+    if parsed
+        .contracts
+        .iter()
+        .any(|contract| contract.functions.iter().any(|func| func.payable))
+    {
+        out.push_str("\n        // TODO: fund this contract for payable handlers\n");
+        out.push_str("        // vm.deal(address(this), 10 ether);\n");
     }
     out.push_str("    }\n");
 
     out.trim_end().to_string()
+}
+
+fn build_setup_imports(parsed: &ParsedRepo) -> String {
+    let mut seen = HashSet::new();
+    let mut out = String::new();
+    out.push_str("import {Test} from \"forge-std/Test.sol\";\n");
+    for contract in &parsed.contracts {
+        let Some(path) = &contract.source_path else {
+            continue;
+        };
+        let line = format!("import {{ {} }} from \"{}\";\n", contract.name, path);
+        if seen.insert(line.clone()) {
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
+fn contract_instance_name(name: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in name.chars().enumerate() {
+        if idx == 0 {
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn detect_solc_version(root: &Path) -> Option<String> {
+    let output = Command::new("forge")
+        .arg("config")
+        .arg("--json")
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+
+    if let Some(version) = value.get("solc_version").and_then(Value::as_str) {
+        let trimmed = version.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(version) = value.get("solcVersion").and_then(Value::as_str) {
+        let trimmed = version.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(version) = value.get("solc").and_then(Value::as_str) {
+        let trimmed = version.trim();
+        if !trimmed.is_empty() && looks_like_version(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let out_dir = value
+        .get("out")
+        .and_then(Value::as_str)
+        .unwrap_or("out");
+    let out_path = root.join(out_dir);
+    let artifact = find_first_artifact(&out_path)?;
+    read_solc_version_from_artifact(&artifact)
+}
+
+fn find_first_artifact(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name == "build-info" {
+                continue;
+            }
+            if let Some(found) = find_first_artifact(&path) {
+                return Some(found);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn read_solc_version_from_artifact(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    if let Some(version) = value
+        .get("compiler")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("version"))
+        .and_then(Value::as_str)
+    {
+        return Some(normalize_solc_version(version));
+    }
+    let metadata = value.get("metadata")?;
+    let metadata_value: Value = match metadata {
+        Value::String(payload) => serde_json::from_str(payload).ok()?,
+        other => other.clone(),
+    };
+    let version = metadata_value
+        .get("compiler")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("version"))
+        .and_then(Value::as_str)?;
+    Some(normalize_solc_version(version))
+}
+
+fn normalize_solc_version(version: &str) -> String {
+    let trimmed = version.trim();
+    match trimmed.find('+') {
+        Some(pos) => trimmed[..pos].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+fn looks_like_version(value: &str) -> bool {
+    if value.contains('/') || value.contains('\\') {
+        return false;
+    }
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '^' | '~' | '>' | '<' | '='))
 }
 
 fn find_medusa_json_child(root: &Path) -> Option<PathBuf> {
@@ -92,6 +265,7 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
     let mut platform_depth: Option<i32> = None;
     let mut platform_indent = String::new();
     let mut saw_target = false;
+    let mut saw_args = false;
 
     for raw_line in content.split_inclusive('\n') {
         let (line, line_ending) = split_line_ending(raw_line);
@@ -113,10 +287,21 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
             platform_depth = Some(depth_before + 1);
             platform_indent = leading_whitespace(line);
             saw_target = false;
+            saw_args = false;
         }
 
         if let Some(pdepth) = platform_depth {
-            if depth_before == pdepth && trimmed.starts_with('}') && !saw_target {
+            if depth_before == pdepth && trimmed.starts_with('}') && (!saw_target || !saw_args) {
+                let mut inserts = Vec::new();
+                if !saw_target {
+                    inserts.push(format!("{}  \"target\": \".\"", platform_indent));
+                }
+                if !saw_args {
+                    inserts.push(format!(
+                        "{}  \"args\": [\"--compile-force-framework\", \"foundry\", \"--foundry-compile-all\"]",
+                        platform_indent
+                    ));
+                }
                 if let Some(last) = output.last_mut() {
                     let (last_line, last_ending) = split_line_ending(last);
                     let last_trim = last_line.trim_end();
@@ -132,9 +317,12 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
                         *last = updated;
                     }
                 }
-                let insert_line = format!("{}  \"target\": \"test/fuzzing\"", platform_indent);
                 let insert_ending = if line_ending.is_empty() { "\n" } else { line_ending };
-                output.push(format!("{insert_line}{insert_ending}"));
+                let inserts_len = inserts.len();
+                for (idx, insert_line) in inserts.into_iter().enumerate() {
+                    let comma = if idx + 1 < inserts_len { "," } else { "" };
+                    output.push(format!("{insert_line}{comma}{insert_ending}"));
+                }
                 changed = true;
             }
         }
@@ -164,13 +352,26 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
         if let Some(pdepth) = platform_depth {
             if depth_before >= pdepth && trimmed.starts_with("\"target\"") {
                 let indent = leading_whitespace(line);
-                let comma = if trimmed.ends_with(',') { "," } else { "" };
-                let new_line = format!("{indent}\"target\": \"test/fuzzing\"{comma}");
-                if new_line != updated_line {
-                    updated_line = new_line;
+                saw_target = true;
+                if trimmed.contains("\"test/fuzzing\"") || trimmed.contains(": \"\"") {
+                    let comma = if trimmed.ends_with(',') { "," } else { "" };
+                    let new_line = format!("{indent}\"target\": \".\"{comma}");
+                    if new_line != updated_line {
+                        updated_line = new_line;
+                        changed = true;
+                    }
+                }
+            }
+            if depth_before >= pdepth && trimmed.starts_with("\"args\"") {
+                saw_args = true;
+                if let Some(replaced) = replace_empty_array_field(
+                    line,
+                    "\"args\"",
+                    "[\"--compile-force-framework\", \"foundry\", \"--foundry-compile-all\"]",
+                ) {
+                    updated_line = replaced;
                     changed = true;
                 }
-                saw_target = true;
             }
         }
 
@@ -187,6 +388,7 @@ fn patch_medusa_json(content: &str) -> (String, bool) {
             if depth < pdepth {
                 platform_depth = None;
                 saw_target = false;
+                saw_args = false;
             }
         }
     }
@@ -320,12 +522,9 @@ fn handler_name_for(contract_name: &str) -> String {
 fn build_handler_contract_for(
     contract: &ParsedContract,
     handler_name: String,
-    args: &Args,
+    solc_version: &str,
 ) -> Contract {
-    let mut imports = ContractType::Handler.import().to_string();
-    imports.push('\n');
-    imports.push_str(&build_handler_interface(contract));
-
+    let imports = ContractType::Handler.import().to_string();
     let body = build_handler_body(contract);
 
     ContractBuilder::new()
@@ -333,13 +532,14 @@ fn build_handler_contract_for(
         .with_name(handler_name)
         .with_imports(imports)
         .with_body(body)
-        .with_solc(args.solc.clone())
+        .with_abstract(true)
+        .with_solc(solc_version.to_string())
         .build()
 }
 
 fn create_handler_contracts_from_parsed(
     parsed: &ParsedRepo,
-    args: &Args,
+    solc_version: &str,
     path: &Path,
 ) -> Result<Vec<Contract>> {
     if parsed.contracts.is_empty() {
@@ -356,7 +556,7 @@ fn create_handler_contracts_from_parsed(
     let mut contracts = Vec::new();
     for contract in &parsed.contracts {
         let name = handler_name_for(&contract.name);
-        let handler_contract = build_handler_contract_for(contract, name, args);
+        let handler_contract = build_handler_contract_for(contract, name, solc_version);
         handler_contract
             .write_rendered_contract(path)
             .context("Failed to write rendered handler contract")?;
@@ -369,7 +569,7 @@ fn create_handler_contracts_from_parsed(
 
 fn create_property_contracts_from_parsed(
     parsed: &ParsedRepo,
-    args: &Args,
+    solc_version: &str,
     path: &Path,
 ) -> Result<Vec<Contract>> {
     if parsed.contracts.is_empty() {
@@ -389,7 +589,9 @@ fn create_property_contracts_from_parsed(
         let property_contract = ContractBuilder::new()
             .with_type(&ContractType::Property)
             .with_name(name)
-            .with_solc(args.solc.clone())
+            .with_body(build_property_body(contract))
+            .with_abstract(true)
+            .with_solc(solc_version.to_string())
             .build();
 
         property_contract
@@ -440,9 +642,15 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
     let parsed_repo = parse_repo(current_dir.as_path(), args.exclude_scripts)
         .context("Failed to parse current directory")?;
 
+    let solc_version = args
+        .solc
+        .clone()
+        .or_else(|| detect_solc_version(current_dir.as_path()))
+        .unwrap_or_else(|| "0.8.23".to_string());
+
     let handler_parents = create_handler_contracts_from_parsed(
         &parsed_repo,
-        args,
+        solc_version.as_str(),
         &temp_dir.path().join(ContractType::Handler.directory_name()),
     )
     .context("Failed to generate handler parents from parsed repo")?;
@@ -452,7 +660,8 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
         .with_name(format!("{}Parent", &ContractType::Handler.name()))
         .with_imports(parse_child_imports(&handler_parents))
         .with_parents(parse_parents(&handler_parents))
-        .with_solc(args.solc.clone())
+        .with_abstract(true)
+        .with_solc(solc_version.clone())
         .build();
 
     handler_child
@@ -461,7 +670,7 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 
     let properties_parents = create_property_contracts_from_parsed(
         &parsed_repo,
-        args,
+        solc_version.as_str(),
         &temp_dir
             .path()
             .join(ContractType::Property.directory_name()),
@@ -473,7 +682,8 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
         .with_name(format!("{}Parent", &ContractType::Property.name()))
         .with_imports(parse_child_imports(&properties_parents))
         .with_parents(parse_parents(&properties_parents))
-        .with_solc(args.solc.clone())
+        .with_abstract(true)
+        .with_solc(solc_version.clone())
         .build();
 
     property_child
@@ -486,7 +696,8 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 
     let entry_point = ContractBuilder::new()
         .with_type(&ContractType::EntryPoint)
-        .with_solc(args.solc.clone())
+        .with_body("    constructor() payable {\n        setUp();\n    }\n".to_string())
+        .with_solc(solc_version.clone())
         .build();
 
     entry_point
@@ -495,8 +706,11 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 
     let setup = ContractBuilder::new()
         .with_type(&ContractType::Setup)
+        .with_imports(build_setup_imports(&parsed_repo))
+        .with_parents("Test".to_string())
+        .with_abstract(true)
         .with_body(build_setup_body(&parsed_repo))
-        .with_solc(args.solc.clone())
+        .with_solc(solc_version.clone())
         .build();
 
     setup
@@ -535,6 +749,7 @@ mod tests {
             name: "HandlerA".to_string(),
             parents: "HandlersParent".to_string(),
             body: "".to_string(),
+            is_abstract: false,
         }];
 
         assert_eq!(
@@ -553,6 +768,7 @@ mod tests {
                 name: "HandlerA".to_string(),
                 parents: "HandlersParent".to_string(),
                 body: "".to_string(),
+                is_abstract: false,
             },
             Contract {
                 licence: "MIT".to_string(),
@@ -561,6 +777,7 @@ mod tests {
                 name: "HandlerB".to_string(),
                 parents: "HandlersParent".to_string(),
                 body: "".to_string(),
+                is_abstract: false,
             },
         ];
 
@@ -585,6 +802,7 @@ mod tests {
             name: "HandlerA".to_string(),
             parents: "HandlersParent".to_string(),
             body: "".to_string(),
+            is_abstract: false,
         }];
 
         assert_eq!(parse_parents(parents.as_ref()), "HandlerA");
@@ -600,6 +818,7 @@ mod tests {
                 name: "HandlerA".to_string(),
                 parents: "HandlersParent".to_string(),
                 body: "".to_string(),
+                is_abstract: false,
             },
             Contract {
                 licence: "MIT".to_string(),
@@ -608,6 +827,7 @@ mod tests {
                 name: "HandlerB".to_string(),
                 parents: "HandlersParent".to_string(),
                 body: "".to_string(),
+                is_abstract: false,
             },
         ];
 
@@ -723,7 +943,7 @@ mod tests {
 
         let args = Args {
             overwrite: true,
-            solc: "0.8.23".to_string(),
+            solc: Some("0.8.23".to_string()),
             exclude_scripts: true,
         };
 

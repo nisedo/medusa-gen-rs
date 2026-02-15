@@ -1,6 +1,7 @@
 # Medusa Template Generator
 
 Generate a Medusa fuzzing scaffold in `./test/fuzzing` for the repository you run it in.
+Foundry-only (requires `forge`).
 
 Made with ♥ by Wonderland (https://defi.sucks)
 
@@ -53,13 +54,35 @@ medusa-gen --overwrite
 
 ## Options
 
-- `--solc`: Solidity pragma version to emit (default: `0.8.23`).
+- `--solc`: Solidity pragma version to emit (default: detected from `forge config --json` `solc_version`, fallback `0.8.23`).
 - `--exclude-scripts` / `--no-exclude-scripts`: Exclude `script/` directories and `*Script` contracts (default: exclude).
 - `--overwrite`: Overwrite `./test/fuzzing` if it already exists.
 
+## Fuzz Cheat Sheet
+
+Common helpers used in fuzz scaffolds (from `forge-std`):
+
+- `vm.assume(condition)`: Discard input if condition is false (constraint filtering).
+- `bound(x, min, max)`: Clamp input to a range (wraps `vm.assume` internally).
+- `vm.prank(addr)`: Next call uses `addr` as `msg.sender`.
+- `vm.startPrank(addr)` / `vm.stopPrank()`: Prank multiple calls.
+- `hoax(addr)`: `deal(addr, 1 ether)` + `vm.prank(addr)` (or current `msg.value`).
+- `startHoax(addr)` / `stopHoax()`: Like `hoax` but for multiple calls.
+- `deal(tokenOrAddr, who, amount)`: Set ETH/ERC20 balance.
+- `vm.warp(timestamp)`: Set `block.timestamp`.
+- `vm.roll(blockNumber)`: Set `block.number`.
+
+Docs:
+
+```
+https://getfoundry.sh/reference/cheatcodes/overview/
+https://getfoundry.sh/reference/forge-std/std-cheats/
+https://raw.githubusercontent.com/foundry-rs/forge-std/master/src/StdUtils.sol
+```
+
 ## Parsing and ABI
 
-By default, `medusa-gen` runs `forge build` and reads ABIs from `out/` to discover public/external state-changing functions, including inherited ones. If ABI parsing fails, it falls back to a lightweight source parser and logs the fallback.
+`medusa-gen` runs `forge build` and reads ABIs from `out/` to discover public/external state-changing functions, including inherited ones. This requires a Foundry project.
 
 If a function has tuple types, the handler uses a raw calldata wrapper:
 
@@ -72,7 +95,8 @@ If `medusa.json` is not found in the repo root (or one level below), `medusa-gen
 
 - `"corpusDirectory": "test/fuzzing/medusa-corpus"`
 - `"targetContracts": ["FuzzTest"]`
-- `compilation.platformConfig.target = "test/fuzzing"`
+- `compilation.platformConfig.target = "."`
+- `compilation.platformConfig.args = ["--compile-force-framework", "foundry", "--foundry-compile-all"]` (if empty)
 
 ## Output summary
 
