@@ -19,14 +19,6 @@ use std::process::Command;
 use tempfile::TempDir;
 use std::{collections::HashSet};
 
-/// Create the "import { HandlerA, HandlerB } from './handlers/HandlersParent.t.sol';" from a vec of parent contracts
-fn parse_child_imports(parents: &[Contract]) -> String {
-    parents.iter().fold(String::new(), |mut output, b| {
-        let _ = writeln!(output, "import {{ {} }} from './{}.t.sol';", b.name, b.name);
-        output
-    })
-}
-
 /// Create the "HandlerA, HandlerB" in "contract HandlersParent is HandlerA, HandlerB"
 /// the "is" statement is conditionnaly added in the template
 fn parse_parents(parents: &[Contract]) -> String {
@@ -38,6 +30,18 @@ fn parse_parents(parents: &[Contract]) -> String {
         })
         .trim_end_matches(", ")
         .to_string()
+}
+
+/// Create imports for entry point from property contracts.
+fn parse_entry_imports(properties: &[Contract]) -> String {
+    properties.iter().fold(String::new(), |mut output, b| {
+        let _ = writeln!(
+            output,
+            "import {{ {} }} from './properties/{}.t.sol';",
+            b.name, b.name
+        );
+        output
+    })
 }
 
 fn build_setup_body(parsed: &ParsedRepo) -> String {
@@ -519,6 +523,10 @@ fn handler_name_for(contract_name: &str) -> String {
     }
 }
 
+fn entry_point_body() -> String {
+    "    constructor() payable {\n        setUp();\n    }\n".to_string()
+}
+
 fn build_handler_contract_for(
     contract: &ParsedContract,
     handler_name: String,
@@ -586,9 +594,16 @@ fn create_property_contracts_from_parsed(
     let mut contracts = Vec::new();
     for contract in &parsed.contracts {
         let name = format!("{}{}", ContractType::Property.name(), contract.name);
+        let handler_name = handler_name_for(&contract.name);
+        let imports = format!(
+            "import {{ {} }} from '../handlers/{}.t.sol';\n",
+            handler_name, handler_name
+        );
         let property_contract = ContractBuilder::new()
             .with_type(&ContractType::Property)
             .with_name(name)
+            .with_imports(imports)
+            .with_parents(handler_name)
             .with_body(build_property_body(contract))
             .with_abstract(true)
             .with_solc(solc_version.to_string())
@@ -639,7 +654,7 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 
     ensure_medusa_json(current_dir.as_path()).context("Failed to ensure medusa.json")?;
 
-    let parsed_repo = parse_repo(current_dir.as_path(), args.exclude_scripts)
+    let parsed_repo = parse_repo(current_dir.as_path(), true)
         .context("Failed to parse current directory")?;
 
     let solc_version = args
@@ -648,27 +663,14 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
         .or_else(|| detect_solc_version(current_dir.as_path()))
         .unwrap_or_else(|| "0.8.23".to_string());
 
-    let handler_parents = create_handler_contracts_from_parsed(
+    let handler_contracts = create_handler_contracts_from_parsed(
         &parsed_repo,
         solc_version.as_str(),
         &temp_dir.path().join(ContractType::Handler.directory_name()),
     )
     .context("Failed to generate handler parents from parsed repo")?;
 
-    let handler_child = ContractBuilder::new()
-        .with_type(&ContractType::Handler)
-        .with_name(format!("{}Parent", &ContractType::Handler.name()))
-        .with_imports(parse_child_imports(&handler_parents))
-        .with_parents(parse_parents(&handler_parents))
-        .with_abstract(true)
-        .with_solc(solc_version.clone())
-        .build();
-
-    handler_child
-        .write_rendered_contract(&temp_dir.path().join(ContractType::Handler.directory_name()))
-        .context("Failed to write rendered handler child")?;
-
-    let properties_parents = create_property_contracts_from_parsed(
+    let property_contracts = create_property_contracts_from_parsed(
         &parsed_repo,
         solc_version.as_str(),
         &temp_dir
@@ -677,26 +679,11 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
     )
     .context("Failed to generate handler property")?;
 
-    let property_child = ContractBuilder::new()
-        .with_type(&ContractType::Property)
-        .with_name(format!("{}Parent", &ContractType::Property.name()))
-        .with_imports(parse_child_imports(&properties_parents))
-        .with_parents(parse_parents(&properties_parents))
-        .with_abstract(true)
-        .with_solc(solc_version.clone())
-        .build();
-
-    property_child
-        .write_rendered_contract(
-            &temp_dir
-                .path()
-                .join(ContractType::Property.directory_name()),
-        )
-        .context("Failed to write rendered property child")?;
-
     let entry_point = ContractBuilder::new()
         .with_type(&ContractType::EntryPoint)
-        .with_body("    constructor() payable {\n        setUp();\n    }\n".to_string())
+        .with_imports(parse_entry_imports(&property_contracts))
+        .with_parents(parse_parents(&property_contracts))
+        .with_body(entry_point_body())
         .with_solc(solc_version.clone())
         .build();
 
@@ -725,8 +712,8 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 
     println!("Generated Medusa fuzzing scaffold");
     println!("- contracts: {}", parsed_repo.contracts.len());
-    println!("- handlers: {}", handler_parents.len());
-    println!("- properties: {}", properties_parents.len());
+    println!("- handlers: {}", handler_contracts.len());
+    println!("- properties: {}", property_contracts.len());
     println!("- output: ./test/fuzzing");
     println!("- medusa.json: patched");
 
@@ -739,59 +726,6 @@ pub fn generate_test_suite(args: &Args) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
-
-    #[test]
-    fn test_parse_child_imports() {
-        let parents = vec![Contract {
-            licence: "MIT".to_string(),
-            solc: "0.8.23".to_string(),
-            imports: "".to_string(),
-            name: "HandlerA".to_string(),
-            parents: "HandlersParent".to_string(),
-            body: "".to_string(),
-            is_abstract: false,
-        }];
-
-        assert_eq!(
-            parse_child_imports(parents.as_ref()),
-            "import { HandlerA } from './HandlerA.t.sol';\n"
-        );
-    }
-
-    #[test]
-    fn test_parse_child_imports_two() {
-        let parents = vec![
-            Contract {
-                licence: "MIT".to_string(),
-                solc: "0.8.23".to_string(),
-                imports: "".to_string(),
-                name: "HandlerA".to_string(),
-                parents: "HandlersParent".to_string(),
-                body: "".to_string(),
-                is_abstract: false,
-            },
-            Contract {
-                licence: "MIT".to_string(),
-                solc: "0.8.23".to_string(),
-                imports: "".to_string(),
-                name: "HandlerB".to_string(),
-                parents: "HandlersParent".to_string(),
-                body: "".to_string(),
-                is_abstract: false,
-            },
-        ];
-
-        assert_eq!(
-                parse_child_imports(parents.as_ref()),
-                "import { HandlerA } from './HandlerA.t.sol';\nimport { HandlerB } from './HandlerB.t.sol';\n"
-            );
-    }
-
-    #[test]
-    fn test_parse_child_imports_empty() {
-        let parents = vec![];
-        assert_eq!(parse_child_imports(parents.as_ref()), "");
-    }
 
     #[test]
     fn test_parse_parents() {
@@ -838,6 +772,31 @@ mod tests {
     fn test_parse_parents_empty() {
         let parents = vec![];
         assert_eq!(parse_parents(parents.as_ref()), "");
+    }
+
+    #[test]
+    fn test_parse_entry_imports() {
+        let props = vec![Contract {
+            licence: "MIT".to_string(),
+            solc: "0.8.23".to_string(),
+            imports: "".to_string(),
+            name: "PropertiesA".to_string(),
+            parents: "".to_string(),
+            body: "".to_string(),
+            is_abstract: false,
+        }];
+
+        assert_eq!(
+            parse_entry_imports(props.as_ref()),
+            "import { PropertiesA } from './properties/PropertiesA.t.sol';\n"
+        );
+    }
+
+    #[test]
+    fn test_entry_point_body() {
+        let body = entry_point_body();
+        assert!(body.contains("constructor() payable"));
+        assert!(body.contains("setUp();"));
     }
 
     // All the move_temp_contents are in serial to avoid having race conditions
@@ -944,7 +903,6 @@ mod tests {
         let args = Args {
             overwrite: true,
             solc: Some("0.8.23".to_string()),
-            exclude_scripts: true,
         };
 
         let result = generate_test_suite(&args);
@@ -952,9 +910,7 @@ mod tests {
 
         let fuzz_dir = Path::new("test/fuzzing");
         assert!(fuzz_dir.join("handlers/HandlerSample.t.sol").exists());
-        assert!(fuzz_dir.join("handlers/HandlersParent.t.sol").exists());
         assert!(fuzz_dir.join("properties/PropertiesSample.t.sol").exists());
-        assert!(fuzz_dir.join("properties/PropertiesParent.t.sol").exists());
         assert!(fuzz_dir.join("Setup.t.sol").exists());
         assert!(fuzz_dir.join("FuzzTest.t.sol").exists());
 

@@ -13,10 +13,6 @@ pub struct Args {
     #[arg(short, long)]
     pub solc: Option<String>,
 
-    /// Exclude script contracts from parsed projects (e.g. Foundry script/)
-    #[arg(long, default_value_t = true)]
-    pub exclude_scripts: bool,
-
     /// Overwrite existing files
     #[arg(short, long, default_value_t = false)]
     pub overwrite: bool,

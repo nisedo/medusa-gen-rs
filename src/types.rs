@@ -137,12 +137,8 @@ impl ContractType {
     pub fn import(&self) -> &'static str {
         match self {
             ContractType::Handler => "import {Setup} from '../Setup.t.sol';\n",
-            ContractType::Property => {
-                "import {HandlersParent} from '../handlers/HandlersParent.t.sol';\n"
-            }
-            ContractType::EntryPoint => {
-                "import {PropertiesParent} from './properties/PropertiesParent.t.sol';\n"
-            }
+            ContractType::Property => "",
+            ContractType::EntryPoint => "",
             ContractType::Setup => "",
         }
     }
@@ -150,8 +146,8 @@ impl ContractType {
     pub fn import_name(&self) -> &'static str {
         match self {
             ContractType::Handler => "Setup",
-            ContractType::Property => "HandlersParent",
-            ContractType::EntryPoint => "PropertiesParent",
+            ContractType::Property => "",
+            ContractType::EntryPoint => "",
             ContractType::Setup => "",
         }
     }

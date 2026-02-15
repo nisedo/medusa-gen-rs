@@ -939,3 +939,92 @@ fn canonicalize_type(ty: &str) -> String {
     }
     parts.join("")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_build_property_body_returns_bool() {
+        let contract = ParsedContract {
+            name: "Sample".to_string(),
+            functions: Vec::new(),
+            constructor: None,
+            source_path: None,
+        };
+        let body = build_property_body(&contract);
+        assert!(body.contains("returns (bool)"));
+        assert!(body.contains("return true;"));
+    }
+
+    #[test]
+    fn test_parse_abi_functions_orders_by_ast() {
+        let abi = vec![
+            json!({
+                "type": "function",
+                "name": "b",
+                "stateMutability": "nonpayable",
+                "inputs": []
+            }),
+            json!({
+                "type": "function",
+                "name": "a",
+                "stateMutability": "nonpayable",
+                "inputs": []
+            }),
+        ];
+
+        let mut method_identifiers = HashMap::new();
+        method_identifiers.insert("a()".to_string(), "aaaaaaaa".to_string());
+        method_identifiers.insert("b()".to_string(), "bbbbbbbb".to_string());
+
+        let mut order_map = HashMap::new();
+        order_map.insert("aaaaaaaa".to_string(), 0);
+        order_map.insert("bbbbbbbb".to_string(), 1);
+
+        let functions = parse_abi_functions(&abi, &method_identifiers, &order_map, &[]);
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0].name, "a");
+        assert_eq!(functions[1].name, "b");
+    }
+
+    #[test]
+    fn test_parse_abi_functions_marks_inherited_origin() {
+        let abi = vec![json!({
+            "type": "function",
+            "name": "withdraw",
+            "stateMutability": "nonpayable",
+            "inputs": [
+                {"type": "uint256"},
+                {"type": "address"},
+                {"type": "address"}
+            ]
+        })];
+
+        let method_identifiers = HashMap::new();
+        let order_map = HashMap::new();
+        let mut sigs = HashSet::new();
+        sigs.insert("withdraw(uint256,address,address)".to_string());
+        let base_signatures = vec![("ERC4626".to_string(), sigs)];
+
+        let functions = parse_abi_functions(&abi, &method_identifiers, &order_map, &base_signatures);
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].origin.as_deref(), Some("ERC4626"));
+    }
+
+    #[test]
+    fn test_handler_function_name_with_origin() {
+        let mut counts = HashMap::new();
+        counts.insert(handler_name_key("transfer", Some("ERC4626")), 1);
+        let mut seen = HashMap::new();
+        let name = handler_function_name(
+            "BriVault",
+            "transfer",
+            Some("ERC4626"),
+            &counts,
+            &mut seen,
+        );
+        assert_eq!(name, "handleBriVaultERC4626Transfer");
+    }
+}

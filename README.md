@@ -15,19 +15,15 @@ test/fuzzing/
 ├── Setup.t.sol
 ├── PROPERTIES.md
 ├── handlers/
-│   ├── HandlersParent.t.sol
 │   └── Handler<ContractName>.t.sol
 └── properties/
-    ├── PropertiesParent.t.sol
     └── Properties<ContractName>.t.sol
 ```
 
 Inheritance tree:
 
-- `FuzzTest` inherits `PropertiesParent`.
-- `PropertiesParent` inherits each `Properties<ContractName>`.
-- Each `Properties<ContractName>` inherits `HandlersParent`.
-- `HandlersParent` inherits each `Handler<ContractName>`.
+- `FuzzTest` inherits each `Properties<ContractName>`.
+- Each `Properties<ContractName>` inherits its `Handler<ContractName>`.
 - Each `Handler<ContractName>` inherits `Setup`.
 
 ## Installation
@@ -55,7 +51,6 @@ medusa-gen --overwrite
 ## Options
 
 - `--solc`: Solidity pragma version to emit (default: detected from `forge config --json` `solc_version`, fallback `0.8.23`).
-- `--exclude-scripts` / `--no-exclude-scripts`: Exclude `script/` directories and `*Script` contracts (default: exclude).
 - `--overwrite`: Overwrite `./test/fuzzing` if it already exists.
 
 ## Fuzz Cheat Sheet
